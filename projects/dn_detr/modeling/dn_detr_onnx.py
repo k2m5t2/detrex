@@ -26,7 +26,7 @@ from detectron2.modeling import detector_postprocess
 from detectron2.structures import Boxes, ImageList, Instances
 
 
-class DNDETR(nn.Module):
+class DNDETR_ONNX(nn.Module):
     """Implement DN-DETR in `DN-DETR: Dynamic Anchor Boxes are Better Queries for DETR
     <https://arxiv.org/abs/2201.12329>`_
 
@@ -80,7 +80,7 @@ class DNDETR(nn.Module):
         with_indicator: bool = True,
         device="cuda",
     ):
-        super(DNDETR, self).__init__()
+        super(DNDETR_ONNX, self).__init__()
         # define backbone and position embedding module
         self.backbone = backbone
         self.in_features = in_features
@@ -178,34 +178,22 @@ class DNDETR(nn.Module):
                 - dict["aux_outputs"]: Optional, only returned when auxilary losses are activated. It is a list of
                             dictionnaries containing the two above keys for each decoder layer.
         """
-        images = self.preprocess_image(batched_inputs)
-
-        if self.training:
-            batch_size, _, H, W = images.tensor.shape
-            img_masks = images.tensor.new_ones(batch_size, H, W)
-            for img_id in range(batch_size):
-                img_h, img_w = batched_inputs[img_id]["instances"].image_size
-                img_masks[img_id, :img_h, :img_w] = 0
-        else:
-            batch_size, _, H, W = images.tensor.shape
-            img_masks = images.tensor.new_zeros(batch_size, H, W)
-
-        # only use last level feature as DAB-DETR
-        features = self.backbone(images.tensor)[self.in_features[-1]]
+        
+        images = self.normalizer(batched_inputs)
+        
+        
+        # todo: remove this part, as mask is not needed for batch=1.
+        batch_size, _, H, W = images.shape
+        img_masks = images.new_zeros(batch_size, H, W)
+        
+        features = self.backbone(images)[self.in_features[-1]]
         features = self.input_proj(features)
         img_masks = F.interpolate(img_masks[None], size=features.shape[-2:]).to(torch.bool)[0]
+        # img_masks = F.interpolate(img_masks[None], scale_factor=(1/32, 1/32)).to(torch.bool)[0]
         pos_embed = self.position_embedding(img_masks)
-
-        # collect ground truth for denoising generation
-        if self.training:
-            gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
-            targets = self.prepare_targets(gt_instances)
-            gt_labels_list = [t["labels"] for t in targets]
-            gt_boxes_list = [t["boxes"] for t in targets]
-        else:
-            # set to None during inference
-            targets = None
-
+        
+        targets = None
+        
         # for vallina dn-detr, label queries in the matching part is encoded as "no object" (the last class)
         # in the label encoder.
         matching_label_query = self.denoising_generator.label_encoder(
@@ -214,8 +202,8 @@ class DNDETR(nn.Module):
         indicator_for_matching_part = torch.zeros([self.num_queries, 1]).to(self.device)
         matching_label_query = torch.cat(
             [matching_label_query, indicator_for_matching_part], 1
-        ).repeat(batch_size, 1, 1)
-        matching_box_query = self.anchor_box_embed.weight.repeat(batch_size, 1, 1)
+        ).repeat(batch_size, 1, 1) # (num_q, emd-1) + (num_q, 1) -> (num_q, emd) -> (bs, num_q, 1)
+        matching_box_query = self.anchor_box_embed.weight.repeat(batch_size, 1, 1) #(bs, num_q, 4)
 
         if targets is None:
             input_label_query = matching_label_query.transpose(0, 1)  # (num_queries, bs, embed_dim)
@@ -223,22 +211,7 @@ class DNDETR(nn.Module):
             attn_mask = None
             denoising_groups = self.denoising_groups
             max_gt_num_per_image = 0
-        else:
-            # generate denoising queries and attention masks
-            (
-                noised_label_queries,
-                noised_box_queries,
-                attn_mask,
-                denoising_groups,
-                max_gt_num_per_image,
-            ) = self.denoising_generator(gt_labels_list, gt_boxes_list)
-
-            # concate dn queries and matching queries as input
-            input_label_query = torch.cat(
-                [noised_label_queries, matching_label_query], 1
-            ).transpose(0, 1)
-            input_box_query = torch.cat([noised_box_queries, matching_box_query], 1).transpose(0, 1)
-
+            
         hidden_states, reference_boxes = self.transformer(
             features,
             img_masks,
@@ -249,119 +222,23 @@ class DNDETR(nn.Module):
         )
 
         # Calculate output coordinates and classes.
-        reference_boxes = inverse_sigmoid(reference_boxes)
-        anchor_box_offsets = self.bbox_embed(hidden_states)
+        reference_boxes = inverse_sigmoid(reference_boxes[-1])  # (bs, num_q, 4)
+        anchor_box_offsets = self.bbox_embed(hidden_states[-1]) # (bs, num_q, emd) -> # (bs, num_q, 4)
         outputs_coord = (reference_boxes + anchor_box_offsets).sigmoid()
-        outputs_class = self.class_embed(hidden_states)
+        outputs_class = self.class_embed(hidden_states[-1])  # (bs, num_q, emd) -> # (bs, num_q, 1)
 
-        # denoising post process
-        output = {
-            "denoising_groups": torch.tensor(denoising_groups).to(self.device),
-            "max_gt_num_per_image": torch.tensor(max_gt_num_per_image).to(self.device),
-        }
-        outputs_class, outputs_coord = self.dn_post_process(outputs_class, outputs_coord, output)
+        # no need for denoising post process, as only matching part remained.
+ 
+        #  return last layer state, so take index=0
+        box_cls = outputs_class[0]   # (1, num_q, 1)  ->  (num_q, 1)
+        box_pred = outputs_coord[0]   # (1, num_q, 4)  ->  (num_q, 4)
+        
+        # bs = 1 for onnx converting, so just take the index = 0 for simplification.
+        out_cls = box_cls.sigmoid()
+        out_box = box_cxcywh_to_xyxy(box_pred)  #  convert to xyxy format, (num_q, 4)
+        
+        return out_cls, out_box
 
-        output.update({"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]})
-        if self.aux_loss:
-            output["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
+       ###### The following content is omitted  #######
 
-        if self.training:
-            loss_dict = self.criterion(output, targets)
-            weight_dict = self.criterion.weight_dict
-            for k in loss_dict.keys():
-                if k in weight_dict:
-                    loss_dict[k] *= weight_dict[k]
-            return loss_dict
-        else:
-            box_cls = output["pred_logits"]
-            box_pred = output["pred_boxes"]
-            results = self.inference(box_cls, box_pred, images.image_sizes)
-            processed_results = []
-            for results_per_image, input_per_image, image_size in zip(
-                results, batched_inputs, images.image_sizes
-            ):
-                height = input_per_image.get("height", image_size[0])
-                width = input_per_image.get("width", image_size[1])
-                r = detector_postprocess(results_per_image, height, width)
-                processed_results.append({"instances": r})
-            return processed_results
 
-    def dn_post_process(self, outputs_class, outputs_coord, output):
-        if output and output["max_gt_num_per_image"] > 0:
-            padding_size = output["max_gt_num_per_image"] * output["denoising_groups"]
-            output_known_class = outputs_class[:, :, :padding_size, :]
-            output_known_coord = outputs_coord[:, :, :padding_size, :]
-            outputs_class = outputs_class[:, :, padding_size:, :]
-            outputs_coord = outputs_coord[:, :, padding_size:, :]
-
-            out = {"pred_logits": output_known_class[-1], "pred_boxes": output_known_coord[-1]}
-            if self.aux_loss:
-                out["aux_outputs"] = self._set_aux_loss(output_known_class, output_known_coord)
-            output["denoising_output"] = out
-        return outputs_class, outputs_coord
-
-    @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
-        # this is a workaround to make torchscript happy, as torchscript
-        # doesn't support dictionary with non-homogeneous values, such
-        # as a dict having both a Tensor and a list.
-        return [
-            {"pred_logits": a, "pred_boxes": b}
-            for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
-        ]
-
-    def inference(self, box_cls, box_pred, image_sizes):
-        """Inference function for DN-DETR
-
-        Args:
-            box_cls (torch.Tensor): tensor of shape ``(batch_size, num_queries, K)``.
-                The tensor predicts the classification probability for each query.
-            box_pred (torch.Tensor): tensors of shape ``(batch_size, num_queries, 4)``.
-                The tensor predicts 4-vector ``(x, y, w, h)`` box
-                regression values for every queryx
-            image_sizes (List[torch.Size]): the input image sizes
-
-        Returns:
-            results (List[Instances]): a list of #images elements.
-        """
-        assert len(box_cls) == len(image_sizes)
-        results = []
-
-        # Select top-k confidence boxes for inference
-        prob = box_cls.sigmoid()
-        topk_values, topk_indexes = torch.topk(
-            prob.view(box_cls.shape[0], -1),
-            self.select_box_nums_for_evaluation,
-            dim=1,
-        )
-        scores = topk_values
-        topk_boxes = torch.div(topk_indexes, box_cls.shape[2], rounding_mode="floor")
-        labels = topk_indexes % box_cls.shape[2]
-        boxes = torch.gather(box_pred, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
-
-        for i, (scores_per_image, labels_per_image, box_pred_per_image, image_size) in enumerate(
-            zip(scores, labels, boxes, image_sizes)
-        ):
-            result = Instances(image_size)
-            result.pred_boxes = Boxes(box_cxcywh_to_xyxy(box_pred_per_image))
-            result.pred_boxes.scale(scale_x=image_size[1], scale_y=image_size[0])
-            result.scores = scores_per_image
-            result.pred_classes = labels_per_image
-            results.append(result)
-        return results
-
-    def prepare_targets(self, targets):
-        new_targets = []
-        for targets_per_image in targets:
-            h, w = targets_per_image.image_size
-            image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
-            gt_classes = targets_per_image.gt_classes
-            gt_boxes = targets_per_image.gt_boxes.tensor / image_size_xyxy
-            gt_boxes = box_xyxy_to_cxcywh(gt_boxes)
-            new_targets.append({"labels": gt_classes, "boxes": gt_boxes})
-        return new_targets
-
-    def preprocess_image(self, batched_inputs):
-        images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
-        images = ImageList.from_tensors(images)
-        return images
